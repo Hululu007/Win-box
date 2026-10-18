@@ -1,0 +1,86 @@
+; build/installer.nsh - Win-Box custom NSIS fragment (picked up automatically: build/installer.nsh)
+;
+; !! 2026-09-30 (user request: data dir = <installDir>/data, see src/main/util/dataDir.ts):
+;   electron-builder's default uninstall logic moves EVERYTHING under $INSTDIR into
+;   $PLUGINSDIR\old-install when updating (--updated), which is cleaned up afterwards.
+;   That would also move "<installDir>/data" (user config / cache / watch history)
+;   away -> every upgrade would lose user data and re-run "first launch".
+;
+;   This macro replaces the default file-removal block in the uninstaller:
+;     - update (--updated): KEEP the "data" directory. Every other top-level child is
+;       moved away like the stock logic:
+;         * directories -> un.atomicRMDir (file-by-file; NSIS Rename handles files
+;           across volumes but NOT directories, hence the recursion);
+;         * plain files  -> direct Rename (cross-volume safe for files).
+;       If a move fails, fall back to delete; if that fails too, leave it (the new
+;       version overwrites same-named files; the running uninstaller itself cannot be
+;       moved/deleted - that is expected and handled by NSIS self-deletion).
+;     - full uninstall: same as the default (RMDir /r $INSTDIR, includes data).
+;
+;   NOTES:
+;     * labels inside an NSIS macro are global after expansion - this macro is inserted
+;       exactly once (un.install section), so the winboxClear* labels stay unique.
+;     * un.atomicRMDir clobbers $R0-$R3, so this loop keeps its handle/name in $R4/$R5.
+;     * keep this file ASCII-only (NSIS does not always read includes as UTF-8).
+;     * verified locally with makensis 3.0.4.1 + a functional harness (.tmp/nsis-func-check.nsi).
+;
+; !! 2026-10-16 (user report: "installer seems frozen (假死) after the install finishes") !!
+;   Investigated + measured on the real 200MB Setup (.tmp/installer-phase-probe.cjs /
+;   .tmp/installer-stall-shot.cjs / .tmp/installer-freeze-probe.cjs):
+;     * a (re)install takes 38-49s, and the wizard looks DEAD for ~35s of it: two long
+;       *single-call* blocking steps inside app-builder-lib's templates -
+;         ① Nsis7z decompress of the ~680MB payload into $PLUGINSDIR\7z-out (~19s),
+;         ② CopyFiles of that tree into $INSTDIR (~13-17s).
+;       Neither reports progress, and electron-builder's install section starts with
+;       `SetDetailsPrint none`, so the details box stays blank -> 2 screenshots 4s apart
+;       are pixel-identical (bar frozen). The installer process itself stays responsive
+;       (Responding=True, sampled by PID) - so it is *perceived* 假死, not a real hang.
+;     * `compression` is NOT the cause: maximum vs normal -> 200.1MB/38.3s vs 200.2MB/42.4s.
+;     * the app side was ruled out too: the "first launch after update wipes winbox-cache"
+;       step clears 2255MB in ~1s (see the user's app log) and runs before createWindow only
+;       for that one launch.
+;   NO repo-side change can make those two calls report progress (they are single blocking
+;   calls in app-builder-lib), so this file is intentionally left unchanged after trying
+;   (and reverting) a page-LEAVE hook that printed an explanation into the details box -
+;   it compiles fine but the text never shows up (the box is effectively suppressed).
+;   Speed levers, if the owner wants them (all touch the release artifact / download size):
+;     · nsis.useZip=true  -> payload becomes a zip and nsisunz extracts DIRECTLY into $INSTDIR
+;                            (removes the temp round-trip = ~half the I/O). Bigger Setup;
+;                            build attempt stalled in 7za here, so it is UNVERIFIED.
+;     · compression=store -> Setup balloons to ~700MB (not recommended).
+;     · a one-time MessageBox on the install page (guaranteed visible) explaining the pause.
+
+!macro customRemoveFiles
+  ${if} ${isUpdated}
+    CreateDirectory "$PLUGINSDIR\old-install"
+    FindFirst $R4 $R5 "$INSTDIR\*.*"
+    winboxClearLoop:
+      StrCmp $R5 "" winboxClearDone
+      StrCmp $R5 "." winboxClearNext
+      StrCmp $R5 ".." winboxClearNext
+      StrCmp $R5 "data" winboxClearNext
+      IfFileExists "$INSTDIR\$R5\*.*" winboxClearDir winboxClearFile
+    winboxClearDir:
+      Push "\$R5"
+      Call un.atomicRMDir
+      Pop $R0
+      ${if} $R0 != 0
+        RMDir /r "$INSTDIR\$R5"
+      ${endif}
+      Goto winboxClearNext
+    winboxClearFile:
+      ClearErrors
+      Rename "$INSTDIR\$R5" "$PLUGINSDIR\old-install\$R5"
+      IfErrors 0 winboxClearNext
+      Delete "$INSTDIR\$R5"
+      RMDir "$INSTDIR\$R5"
+      Goto winboxClearNext
+    winboxClearNext:
+      FindNext $R4 $R5
+      Goto winboxClearLoop
+    winboxClearDone:
+    FindClose $R4
+  ${else}
+    RMDir /r $INSTDIR
+  ${endif}
+!macroend

@@ -1,0 +1,240 @@
+// tests/hlsRewrite.spec.ts — HLS 清单重写（本地中继）的纯函数回归。
+//
+// 背景（「py 源播放：HLS播放失败：KeyLoadError」）：
+//   AES-128 加密流的密钥地址写在 `#EXT-X-KEY:...URI="..."`，它是**注释行**，
+//   此前重写逻辑只处理「非注释行的分片地址」→ 密钥地址原样透传：
+//     · 相对 URI（如 `key.bin`）被 hls.js 按**中继地址**解析 → http://127.0.0.1:9978/key.bin（404）；
+//     · 绝对 URI 又缺 Referer/UA/Cookie → 源站 403。
+//   两者都让 hls.js 抛 keyLoadError 致命错误 → 直接「播放失败」。
+//   修复：带 URI 属性的标签（KEY/MAP/MEDIA/I-FRAME-STREAM-INF/PART…）与分片一律走 /play 中继。
+import { describe, it, expect } from 'vitest';
+import { rewriteM3u8, rewriteUriAttrs, imagePreludeLen, jpegPreludeLen, isTsAligned } from '../src/main/server/LocalProxyServer';
+
+const BASE = 'https://cdn.example.com/hls/index.m3u8';
+const UA = 'Mozilla/5.0 UA';
+const REF = 'https://www.example.com/';
+const CK = 'sid=abc';
+
+const text = (b: Buffer): string => b.toString('utf-8');
+
+describe('rewriteM3u8 — 加密流密钥地址（KeyLoadError 修复）', () => {
+  it('相对密钥 URI → 重写到本地中继（带上同一套 UA/Referer/Cookie）', () => {
+    const src = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x1234',
+      '#EXTINF:10.0,',
+      'seg1.ts',
+      '#EXT-X-KEY:METHOD=AES-128,URI="key2.bin"',
+      'seg2.ts',
+      '#EXT-X-ENDLIST',
+    ].join('\n');
+    const out = text(rewriteM3u8(Buffer.from(src), BASE, UA, REF, CK));
+    // 密钥地址被中继（裸 key.bin 不再出现在清单里）
+    expect(out).not.toMatch(/URI="key\.bin"/);
+    expect(out).toContain('URI="http://127.0.0.1:9978/play?url=');
+    // 中继 URL 里带上了真实的绝对密钥地址 + header
+    const keyRelay = /URI="([^"]+)"/.exec(out)![1];
+    const q = new URLSearchParams(keyRelay.split('?')[1]);
+    expect(q.get('url')).toBe('https://cdn.example.com/hls/key.bin');
+    expect(q.get('referer')).toBe(REF);
+    expect(q.get('ua')).toBe(UA);
+    expect(q.get('cookie')).toBe(CK);
+    // 两个密钥都改写；METHOD 等其余属性原样保留
+    expect(out.match(/URI="http:\/\/127\.0\.0\.1:9978\/play\?/g)).toHaveLength(2);
+    expect(out).toContain('METHOD=AES-128');
+    expect(out).toContain('IV=0x1234');
+    // 分片照旧走中继（回归）
+    expect(out).not.toContain('\nseg1.ts');
+    expect(q.get('url')).toBeTruthy();
+  });
+
+  it('绝对密钥 URI → 同样走中继（补 Referer，源站 403 场景）', () => {
+    const src = '#EXT-X-KEY:METHOD=AES-128,URI="https://keys.other.com/k?token=1"\nseg.ts';
+    const out = text(rewriteM3u8(Buffer.from(src), BASE, UA, REF, CK));
+    const relay = /URI="([^"]+)"/.exec(out)![1];
+    expect(new URLSearchParams(relay.split('?')[1]).get('url')).toBe('https://keys.other.com/k?token=1');
+  });
+
+  it('METHOD=NONE（无 URI）与其它注释行原样保留', () => {
+    const src = ['#EXT-X-KEY:METHOD=NONE', '#EXT-X-TARGETDURATION:10', '#EXT-X-DISCONTINUITY'].join('\n');
+    const out = text(rewriteM3u8(Buffer.from(src), BASE, UA, REF, CK));
+    expect(out).toBe(src);
+  });
+
+  it('幂等：已经是本中继的 URI 不被二次包装', () => {
+    const once = text(rewriteM3u8(Buffer.from('#EXT-X-KEY:URI="k.bin"\nseg.ts', 'utf-8'), BASE, UA, REF, CK));
+    const twice = text(rewriteM3u8(Buffer.from(once, 'utf-8'), BASE, UA, REF, CK));
+    expect(twice).toBe(once);
+  });
+
+  it('初始化段/备用音轨/低延迟分片等 URI 属性一并中继（fMP4 场景）', () => {
+    const src = [
+      '#EXT-X-MAP:URI="init.mp4"',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="中",URI="audio/index.m3u8"',
+      '#EXT-X-PART:DURATION=0.5,URI="part1.mp4",INDEPENDENT=YES',
+      '#EXT-X-STREAM-INF:BANDWIDTH=800000',
+      'v1/index.m3u8',
+    ].join('\n');
+    const out = text(rewriteM3u8(Buffer.from(src), BASE, UA, REF, CK));
+    expect(out).not.toMatch(/URI="init\.mp4"/);
+    expect(out).not.toMatch(/URI="audio\/index\.m3u8"/);
+    expect(out).not.toMatch(/URI="part1\.mp4"/);
+    expect(out.match(/URI="http:\/\/127\.0\.0\.1:9978\/play\?/g)).toHaveLength(3);
+    // 子清单（非注释行）→ 绝对化后中继
+    expect(out).not.toContain('\nv1/index.m3u8');
+    const sub = out.split('\n').find((l) => !l.startsWith('#') && l.includes('/play?'))!;
+    expect(new URLSearchParams(sub.split('?')[1]).get('url')).toBe('https://cdn.example.com/hls/v1/index.m3u8');
+  });
+
+  it('无法解析的 URI（非法/空）不破坏原行', () => {
+    const line = '#EXT-X-KEY:METHOD=AES-128,URI=""';
+    expect(rewriteUriAttrs(line, BASE, UA, REF, CK)).toBe(line);
+  });
+});
+
+// jpg 伪装分片识别（[JPEG 缩略图][真 TS]）。
+describe('jpegPreludeLen / isTsAligned — jpg 伪装分片（某 4K 线路）识别', () => {
+  /** 造一段 TS 载荷：每个 188 包首字节 0x47，其余填 0xAA */
+  const tsPayload = (packets: number): Buffer => {
+    const b = Buffer.alloc(188 * packets, 0xaa);
+    for (let i = 0; i < packets; i++) b[i * 188] = 0x47;
+    return b;
+  };
+  /** 造一个最小 JPEG（SOI + APP0 + 垃圾 + EOI） */
+  const jpeg = (bodyLen: number): Buffer => Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]),
+    Buffer.alloc(bodyLen, 0x33),
+    Buffer.from([0xff, 0xd9]),
+  ]);
+
+  it('JPEG(EOI) 之后是 188 对齐 TS → 返回前导长度（含 EOI）', () => {
+    const j = jpeg(9759); // 仿实测 9875 之前的缩略图体量
+    const buf = Buffer.concat([j, tsPayload(6)]);
+    const pre = jpegPreludeLen(buf);
+    expect(pre).toBe(j.length);
+    expect(buf[pre]).toBe(0x47);
+  });
+
+  it('纯 JPEG（尾随不是 TS）→ 0（普通图片响应不改写）', () => {
+    expect(jpegPreludeLen(Buffer.concat([jpeg(500), Buffer.alloc(2000, 0x00)]))).toBe(0);
+  });
+
+  it('纯 TS（0x47 开头）→ 0', () => {
+    expect(jpegPreludeLen(tsPayload(4))).toBe(0);
+  });
+
+  it('随机字节 / 过短 / 空 → 0', () => {
+    expect(jpegPreludeLen(Buffer.alloc(0))).toBe(0);
+    expect(jpegPreludeLen(Buffer.from([0xff, 0xd8]))).toBe(0);
+    expect(jpegPreludeLen(Buffer.from('not-a-jpeg-at-all....'))).toBe(0);
+  });
+
+  it('JPEG 后 TS 对齐前导不足 4 个同步头（EWOI 贴近缓冲尾部）→ 0（避免尾部样本不足误判）', () => {
+    const buf = Buffer.concat([jpeg(100), tsPayload(2)]); // 只有 2 个包，容不下 4 个同步头
+    expect(jpegPreludeLen(buf)).toBe(0);
+  });
+
+  it('isTsAligned：对齐/错位/越界', () => {
+    const buf = Buffer.concat([Buffer.alloc(3, 0x11), tsPayload(5)]);
+    expect(isTsAligned(buf, 3)).toBe(true);
+    expect(isTsAligned(buf, 4)).toBe(false);
+    expect(isTsAligned(buf, buf.length)).toBe(false);
+  });
+});
+
+describe('imagePreludeLen — PNG 伪装分片识别', () => {
+  const tsPayload = (packets: number): Buffer => {
+    const b = Buffer.alloc(188 * packets, 0xaa);
+    for (let i = 0; i < packets; i++) b[i * 188] = 0x47;
+    return b;
+  };
+  const png = (): Buffer => Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from([0, 0, 0, 13]), Buffer.from('IHDR'), Buffer.alloc(13), Buffer.alloc(4),
+    Buffer.alloc(4), Buffer.from('IEND'), Buffer.alloc(4),
+  ]);
+
+  it('PNG IEND 后是 188 对齐 TS → 返回图片前导长度', () => {
+    const prefix = png();
+    expect(imagePreludeLen(Buffer.concat([prefix, tsPayload(5)]))).toBe(prefix.length);
+  });
+
+  it('图片伪装 HLS 分片暴露 TS 路径，原始签名 URL 不改写', () => {
+    const segment = 'https://cdn.example.com/a.webp?signature=a%2Bb%2Fc%3D';
+    const out = text(rewriteM3u8(Buffer.from('#EXTM3U\n#EXTINF:5,\n' + segment), BASE, UA, REF, CK));
+    const relay = new URL(out.split('\n')[2]);
+    expect(relay.pathname).toBe('/play/segment.ts');
+    expect(relay.search).not.toContain('.webp');
+    expect(relay.searchParams.get('url')).toBe(segment);
+    expect(relay.searchParams.get('ua')).toBe(UA);
+    expect(text(rewriteM3u8(Buffer.from(out), BASE, UA, REF, CK))).toBe(out);
+  });
+
+  it('纯 PNG 或伪造块结构不剥离', () => {
+    const prefix = png();
+    expect(imagePreludeLen(prefix)).toBe(0);
+    const malformed = Buffer.from(prefix);
+    malformed.writeUInt32BE(0x7fffffff, 8);
+    expect(imagePreludeLen(Buffer.concat([malformed, tsPayload(5)]))).toBe(0);
+  });
+
+  it('正常 TS 不剥离', () => {
+    expect(imagePreludeLen(tsPayload(5))).toBe(0);
+  });
+
+  it('图片中的 IEND 字样不当作结束块，完整块和 TS 到齐后才剥离', () => {
+    const data = Buffer.concat([Buffer.from('IEND'), tsPayload(4)]);
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const prefix = Buffer.concat([png().subarray(0, 33), len, Buffer.from('IDAT'), data, Buffer.alloc(4), png().subarray(33)]);
+    const body = Buffer.concat([prefix, tsPayload(5)]);
+    for (const end of [2, 8, 32, prefix.length - 1, prefix.length + 564]) {
+      expect(imagePreludeLen(body.subarray(0, end))).toBe(0);
+    }
+    expect(imagePreludeLen(body)).toBe(prefix.length);
+  });
+});
+
+describe('imagePreludeLen — 部分源 WebP TS_D 分片', () => {
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const header = Buffer.alloc(8); header.write(type); header.writeUInt32LE(data.length, 4);
+    return Buffer.concat([header, data, ...(data.length & 1 ? [Buffer.alloc(1)] : [])]);
+  };
+  const riff = (...chunks: Buffer[]): Buffer => {
+    const data = Buffer.concat([Buffer.from('WEBP'), ...chunks]);
+    const header = Buffer.alloc(8); header.write('RIFF'); header.writeUInt32LE(data.length, 4);
+    return Buffer.concat([header, data]);
+  };
+  const ts = Buffer.alloc(188 * 5, 0xaa);
+  for (let i = 0; i < 5; i++) ts[i * 188] = 0x47;
+  const image = chunk('VP8 ', Buffer.alloc(908)); // 真实样本中 TS_D 在 928，载荷在 936
+
+  it('RIFF 包含尾部 TS_D，而不是 JPEG/PNG 式尾随 → 正确剥离 936 字节', () => {
+    const body = riff(image, chunk('TS_D', ts));
+    expect(imagePreludeLen(body)).toBe(936);
+    expect(imagePreludeLen(body.subarray(0, 936 + 565))).toBe(936);
+    expect(imagePreludeLen(body.subarray(0, 936 + 564))).toBe(0);
+  });
+
+  it('奇数长度块带 padding、VP8L 和扩展头按 chunk 边界走', () => {
+    const chunks = [chunk('VP8X', Buffer.alloc(10)), chunk('VP8L', Buffer.alloc(3))];
+    expect(imagePreludeLen(riff(...chunks, chunk('TS_D', ts)))).toBe(12 + 18 + 12 + 8);
+  });
+
+  it('纯图片、图片内部伪造 TS_D、无图片块均不剥离', () => {
+    expect(imagePreludeLen(riff(image))).toBe(0);
+    expect(imagePreludeLen(riff(chunk('VP8 ', Buffer.concat([chunk('TS_D', ts)]))))).toBe(0);
+    expect(imagePreludeLen(riff(chunk('TS_D', ts)))).toBe(0);
+  });
+
+  it('坏 RIFF/chunk 长度、不对齐 TS、非尾部 TS_D、其他 RIFF 类型不剥离', () => {
+    const body = riff(image, chunk('TS_D', ts));
+    const shortRiff = Buffer.from(body); shortRiff.writeUInt32LE(body.length - 9, 4);
+    const badImage = Buffer.from(body); badImage.writeUInt32LE(0xffffffff, 16);
+    const badTs = Buffer.from(body); badTs[936 + 188] = 0;
+    const wave = Buffer.from(body); wave.write('WAVE', 8);
+    for (const invalid of [shortRiff, badImage, badTs, wave, riff(image, chunk('TS_D', ts), chunk('EXIF', Buffer.alloc(4))),
+      riff(image, chunk('TS_D', ts.subarray(0, ts.length - 1)))]) expect(imagePreludeLen(invalid)).toBe(0);
+  });
+});

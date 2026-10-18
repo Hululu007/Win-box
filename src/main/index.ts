@@ -1,0 +1,600 @@
+// src/main/index.ts — Electron 主进程入口
+// 第一条 import（import 即执行，勿挪位置）：把数据目录切到**安装目录/data**，
+//   并在老用户首次启动时自动迁移 %APPDATA%\win-box（见 dataDirBootstrap.ts 头注释）。
+//   必须早于 logger / 各 Store 的模块求值，否则它们会把路径解析到旧位置。
+import { dataDirReport } from './util/dataDirBootstrap';
+import { app, BrowserWindow, clipboard, dialog, nativeTheme, Notification, shell, webContents } from 'electron';
+import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { registerIpc } from './ipc';
+import { SpiderHost } from './spider/SpiderHost';
+import { LocalProxyServer } from './server/LocalProxyServer';
+import { fileLogger } from './util/logger';
+// 播放诊断上报的收集器（见下方 child-process-gone）
+import { lastMediaSummary, lastMediaWcId } from './util/mediaDiag';
+import { applyUiScale, registerUiWindow, scaledWindowFor, setMainWindowProvider } from './ui/uiScale';
+// 主窗口（与播放器窗口，见 player/PlayerWindow）的位置/尺寸/最大化态落盘并恢复
+import { watchWindowState, windowStateWriter } from './ui/windowState';
+import { BASE_WINDOW } from '../shared/uiScale';
+import { applyWindowCorner } from './util/windowCorner';
+import { bossKey } from './bossKey';
+import { playerWindow, onPlayerWindowClosed } from './player/PlayerWindow';
+import { playerSettings } from './player/playerSettings';
+import { hostRegexFor } from '../engine/util/m3u8Purify';
+import { TorrentPlay } from './torrent/torrentPlay';
+import { DavService } from './webdav/DavService';
+import { DlnaService } from './dlna/DlnaService';
+import { UpdateService } from './update/UpdateService';
+import { DavStore } from './store/DavStore';
+import { JsonStore } from './store/JsonStore';
+import { LocalPkgStore } from './store/LocalPkgStore';
+import { PluginHost } from './plugin/PluginHost';
+import { PlayerEngineController } from './player/PlayerEngineController';
+import { PluginKv } from './plugin/PluginKv';
+import { createPluginSandboxApi } from './plugin/pluginHostApi';
+import { HttpClient } from './net/HttpClient';
+import { LOCAL_PROXY_BASE } from '../shared/constants';
+import { IPC } from '../shared/ipc-channels';
+import { builtinPluginsDir, cacheDir, distDir, legacyLocalImportsDir, localImportsDir, pluginsDir, userDataDir } from './util/paths';
+import { safeStorageDriveCodec } from './util/driveCodec';
+import { clearWinboxCache, type ClearCacheResult } from './util/cacheClean';
+import {
+  isFirstLaunchAfterUpdate,
+  lastRunVersionPath,
+  readLastRunVersion,
+  writeLastRunVersion,
+} from './util/updateCacheReset';
+
+// esbuild 打成 CJS：__dirname 由 Node 提供（= dist/）。资源在 dist/../../resources。
+declare const __dirname: string;
+
+let mainWindow: BrowserWindow | null = null;
+const host = new SpiderHost();
+/**
+ * 磁力（BT）引擎（方案 B）—— aria2c sidecar + 本机中继 `/bt` + 外部播放器接力。
+ * 懒启动（首次磁力播放才拉起 aria2c），退出时 dispose（另有 `--stop-with-process` 兜底防孤儿）。
+ */
+const torrent = new TorrentPlay(fileLogger, () => playerSettings.settings.btExternalPlayer);
+host.torrentPlay = torrent;
+/**
+ * WebDAV 存储：服务器与凭据加密落盘，
+ * 浏览走 PROPFIND、播放走 `/play?dav=<id>` 由中继注入 Authorization（凭据绝不进 URL）。
+ */
+const dav = new DavService(
+  new DavStore(new JsonStore(join(userDataDir(), 'webdav-servers.json')), fileLogger, safeStorageDriveCodec()),
+  fileLogger,
+);
+/** DLNA 投屏（SSDP 发现 + AVTransport 三动作；对位 CatClaw Dlna.cs = TVBox osc/dlna） */
+const dlna = new DlnaService(fileLogger);
+/**
+ * 启动更新检查：本地版本低于 GitHub 最新 Release 时提示用户选择——
+ *   查 `api.github.com`（失败不锁死）→ 代理加速下载 Setup → 拉起安装程序并退出本程序。
+ */
+const updater = new UpdateService(fileLogger);
+/**
+ * 本地包（壳类目录包）：登记表 + `/pkg` 资源路由 + py 就地运行。
+ *   导入安装目录下的 imports 副本，原始包可移动/删除，不影响已导入订阅。
+ */
+const localPkgs = new LocalPkgStore(
+  new JsonStore(join(userDataDir(), 'local-pkgs.json')),
+  LOCAL_PROXY_BASE,
+  localImportsDir(),
+  legacyLocalImportsDir(),
+);
+/**
+ * 插件系统（M1，方案 A）：宿主聚合——
+ *   随包官方插件启动时**物化**（`resources/plugins/*.winbox` → `<userData>/plugins/<id>.winbox/` + 侧签）
+ *   → 与用户安装**同构**；用户插件安装/启停；超分档位 → mpv 着色器**绝对路径**解析。
+ */
+/** R10：L4 沙箱用的 HTTP（独立实例；与 SpiderHost 内部实例同实现，无共享状态） */
+const pluginHttp = new HttpClient();
+const plugins = new PluginHost({
+  pluginsDir: pluginsDir(),
+  builtinDir: builtinPluginsDir(),
+  statePath: join(userDataDir(), 'plugins-state.json'),
+  // 插件设置面板（`contributes.settings.panel`）：宿主**代插件持久化**字段值（读取面留给 L4）
+  settingsPath: join(userDataDir(), 'plugin-settings.json'),
+  // （R11）第三方播放内核：`local-path` 来源的本机程序路径由用户在配置页填写
+  enginePaths: () => playerSettings.settings.enginePaths,
+});
+// （R10）L4 沙箱（`kind:"code"`）：**每插件独立 worker**；宿主能力经 API 面回主进程。
+//   权限门禁在 worker 侧 globals 构造（未授权的 `winbox.*` 根本不存在）；沙箱内无 require/process/fs。
+//   kv 走独立 `<userData>/plugin-kv.json`（键前缀 `plugin:<id>:` 由宿主拼接）；
+//   settings 与设置面板**同一份存储**（`plugin-settings.json`）；
+//   player.control 经 `player:ctl` 事件转给播放器窗口（插件不碰内核）。
+plugins.attachSandbox({
+  workerFile: join(distDir(), 'plugin-worker.cjs'),
+  logger: fileLogger,
+  api: createPluginSandboxApi({
+    http: pluginHttp,
+    logger: fileLogger,
+    pluginsDir: pluginsDir(),
+    settings: plugins.pluginSettingsAccess(),
+    kv: new PluginKv(new JsonStore(join(userDataDir(), 'plugin-kv.json'))),
+    playerRelay: (op, value) => {
+      const w = playerWindow();
+      if (!w) return { ok: false, reason: '播放器未打开' };
+      try {
+        w.webContents.send(IPC.PLAYER_CTL, { op, value });
+        return { ok: true };
+      } catch {
+        return { ok: false, reason: '播放器窗口不可用' };
+      }
+    },
+    notify: (title, body) => {
+      try {
+        new Notification({ title: String(title), body: String(body) }).show();
+      } catch {
+        /* 通知不可用（无权限 / 无 DBus）不影响插件 */
+      }
+    },
+    clipboardRead: () => clipboard.readText(),
+    clipboardWrite: (text) => clipboard.writeText(String(text)),
+    dialogBox: async (op, message, title) => {
+      const w = mainWindow;
+      const r = await dialog.showMessageBox(w ?? undefined!, {
+        type: 'info',
+        title: title || '插件',
+        message: String(message),
+        buttons: op === 'confirm' ? ['取消', '确定'] : ['确定'],
+        cancelId: 0,
+        defaultId: op === 'confirm' ? 1 : 0,
+      });
+      return op === 'confirm' ? r.response === 1 : undefined;
+    },
+    openExternal: (url) => shell.openExternal(url),
+  }),
+});
+// 退出时释放全部 L4 沙箱 worker（避免残留线程）
+app.on('will-quit', () => plugins.dispose());
+/**
+ * （R11）第三方播放内核（`contributes.player.engine`）：宿主托管的引擎**单会话控制器**
+ *   （插件永不拉进程 —— `spawn` 是规范 §6.2 永久禁止项）。与内置 `MpvController` 实例分离，零回归。
+ */
+const playerEngines = new PlayerEngineController(fileLogger);
+app.on('will-quit', () => {
+  try {
+    playerEngines.dispose();
+  } catch {
+    /* ignore */
+  }
+});
+// 插件字幕源（`contributes.subtitle.provider`）：宿主按插件声明取数 →
+//   与内置源（assrt / subtitlecat）合并进同一套字幕检索/下载链路（见 SpiderHost.allSubtitleProviders）。
+host.pluginSubtitleProviders = () => plugins.subtitleProviders();
+// 插件元数据源（`contributes.meta.provider`）：作为**兜底**接进 metaSearch
+//   （内置 TMDB / 豆瓣都未命中时才轮到它；见 SpiderHost.pluginMetaLookup）。
+host.pluginMetaProviders = () => plugins.metaProviders();
+// 插件发现页数据源（`contributes.discover.source`）：作为**增补**接进发现页
+//   （插件分区追加在内置榜单之后；见 SpiderHost.pluginDiscoverSections）。
+host.pluginDiscoverSources = () => plugins.discoverSources();
+// 插件弹幕源（`contributes.danmaku.source`）：与内置外部接口**并列**接进三步弹幕链路
+//   （搜索番剧 → 剧集列表 → 弹幕 XML；见 SpiderHost.danmakuSearch / danmakuEpisodes / danmakuFetch）。
+host.pluginDanmakuSources = () => plugins.danmakuSources();
+// 插件直播输出模板（`contributes.live.template`）：接进「导出直播线路」
+//   （宿主把**已解析**的 LiveGroup[] 按模板格式化输出 TXT / M3U；本类型不发请求、不解析）。
+host.pluginLiveTemplates = () => plugins.liveTemplates();
+const proxy = new LocalProxyServer(
+  fileLogger,
+  () => host.driveList(),
+  // m3u8 去广告注入（默认关，配置页「播放」可开）：
+  //   开关每轮清单回源时现读（改后即时生效）；规则用当前订阅的 rules[].regex 按 host 匹配。
+  {
+    enabled: () => playerSettings.settings.m3u8Purify,
+    rulesFor: (url) => hostRegexFor(url, host.siteConfig?.rules),
+  },
+  // WebDAV 取流认证（凭据只在主进程加密存储里）
+  (id) => dav.authHeader(id),
+);
+// 本地包：包内资源路由（/pkg/<i>/<rel>）+ 订阅 pkg:// 读取
+proxy.pkgRoot = (i) => localPkgs.rootOf(i);
+host.localPkgs = localPkgs;
+host.initializeLocalImports();
+// 把 /play 中继的真实转发字节速率推给渲染层（播放器「缓存中」实时网速）
+const pushSpeed = (kbs: number): void => {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send('net:speed', kbs);
+  }
+};
+proxy.onSpeed = pushSpeed;
+// BT 下载速率走同一条通道（/bt 中继写回字节 + aria2 下载速率）→ 播放器「缓存中 x MB/s」
+torrent.onSpeed = pushSpeed;
+// 壳/蜘蛛的宿主代理（`/proxy/<jvmPort>?do=proxy&key=…`）被访问 → 钉住那个 JVM
+proxy.onSpiderProxy = (port) => host.pinSpiderProxy(port);
+proxy.onPythonProxy = (key, params) => host.pythonProxy(key, params);
+// `/bt/<hash>/<idx>` 取流口（Range + piece 门控 + 本地读盘）
+proxy.bt = torrent;
+
+function isDev(): boolean {
+  return !app.isPackaged && process.env.NODE_ENV !== 'production';
+}
+
+// 渲染策略：**不再强制禁用 GPU/硬件加速**。
+//   过往为"无 GPU/驱动异常环境"加了 disableHardwareAcceleration + disable-gpu + disable-software-rasterizer，
+// 但实测（本机有正常 GPU）强禁后无边框窗口在最大化/resize 时合成器不刷新，
+//   网页只渲染在左上角原尺寸、右侧/下方直接露出 backgroundColor（"最大化异形"）。
+//   交由 Electron/Chromium 按环境自选：有 GPU 走硬件合成（最大化正常），无 GPU 时自动回退软件。
+// no-sandbox / disable-dev-shm-usage 仍保留（子进程沙箱相关，与渲染无关）。
+app.commandLine.appendSwitch('no-sandbox');
+app.commandLine.appendSwitch('disable-dev-shm-usage');
+
+// 原生崩溃此前没有应用日志；记录进程类型/退出码，不记录资源 URL 或凭据。
+app.on('web-contents-created', (_event, contents) => {
+  contents.on('render-process-gone', (_e, details) => {
+    fileLogger.w(`renderer-gone wc=${contents.id} reason=${details.reason} exitCode=${details.exitCode}`);
+  });
+  contents.on('unresponsive', () => fileLogger.w(`renderer-unresponsive wc=${contents.id}`));
+});
+/**
+ * 证据：日志里唯一非 jvm 异常 = `child-process-gone type=GPU reason=crashed exitCode=34`；
+ *   症状完全吻合 —— GPU 子进程（合成器）死掉后整窗内容不再刷新（连进度条都不动），
+ *   音频走另一条通道继续 ⇒ 用户看到的就是「画面消失、只剩声音」。Chromium 不会自愈（不会自动补拉 GPU 进程）。
+ *
+ * ① 恢复：GPU 崩溃后**主动 reload 一次「最后在播放的那个窗口」**。
+ *    · 目标 = 渲染层最近一次上报的窗口（见 util/mediaDiag）→ 回退播放器窗 → 回退主窗；
+ *    · 播放器窗 reload 后由它自己的 `did-finish-load` + `pendingInit` 重发最后一发 init ⇒ 自动续播；
+ *      主窗是 hash 路由，reload 后仍停在原页面（不会跳到首页）。
+ *    · 退避：60s 滑动窗口内 GPU 崩溃 ≥3 次 → 只记日志、不再自动重载（避免与坏驱动形成「崩→载→崩」风暴）。
+ * ② 诊断：日志带上崩溃前的最后一条播放事件（渲染层上报），否则永远只有一行 GPU 崩溃、无从定位。
+ * ③ 有意不做：不重启整个应用（会丢播放器窗、宿主与蜘蛛状态）；不动渲染策略（见上方 GPU/硬件加速注释）。
+ */
+const gpuCrashAt: number[] = [];
+/** 退避判定（本次计入）：60s 内第 3 次及以后不再自动重载 */
+function gpuRecoverAllowed(): boolean {
+  const now = Date.now();
+  while (gpuCrashAt.length && now - gpuCrashAt[0] > 60_000) gpuCrashAt.shift();
+  gpuCrashAt.push(now);
+  return gpuCrashAt.length < 3;
+}
+/** 恢复目标 = 最后在播放的那个窗口 → 播放器窗 → 主窗（都没有则 null） */
+function gpuRecoveryTarget(): BrowserWindow | null {
+  const id = lastMediaWcId();
+  if (id != null) {
+    const wc = webContents.fromId(id);
+    const w = wc ? BrowserWindow.fromWebContents(wc) : null;
+    if (w && !w.isDestroyed()) return w;
+  }
+  const pw = playerWindow();
+  if (pw && !pw.isDestroyed()) return pw;
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+}
+app.on('child-process-gone', (_event, details) => {
+  let suffix = '';
+  if (details.type === 'GPU') {
+    suffix = ` | ${lastMediaSummary()}`;
+    if (!gpuRecoverAllowed()) {
+      suffix += ' | 退避：60s 内第 3 次及以上 GPU 崩溃 → 只记日志、不自动重载';
+    } else {
+      const target = gpuRecoveryTarget();
+      if (!target) {
+        suffix += ' | 未找到可重载的窗口（无播放上报且主窗已关）→ 不恢复';
+      } else {
+        const wcId = target.webContents.id;
+        // 稍等再 reload：给 Chromium 一点时间重建 GPU 进程，立刻 reload 可能又撞上未就绪的合成器
+        setTimeout(() => {
+          try {
+            if (!target.isDestroyed()) target.webContents.reload();
+          } catch {
+            /* ignore */
+          }
+        }, 800);
+        suffix += ` | 已触发 GPU 崩溃恢复：800ms 后重载窗口（wc=${wcId}）`;
+      }
+    }
+  }
+  fileLogger.w(`child-process-gone type=${details.type} reason=${details.reason} exitCode=${details.exitCode}${suffix}`);
+});
+
+function createWindow(): void {
+  /**
+   *   默认窗口尺寸与最小尺寸都按**当前显示器工作区**推出来的倍率等比放大（见 `ui/uiScale`），
+   *   并用 `setZoomFactor` 把整套 UI（含字号）一起放大 —— 1K 下仍是 1280×800（回归不变），
+   *   4K 下窗口与字体同步变大，不再「UI 特别小」。
+   */
+  const size = scaledWindowFor(BASE_WINDOW);
+  /**
+   *   有「上次的位置/尺寸/最大化态」就按它开窗（已按当前显示器工作区夹好，见 shared/windowState）；
+   *   没有记忆或是脏数据 → 回落到按屏幕推出的大小（= 首启行为不变）。
+   */
+  const remembered = windowStateWriter('main').load({ width: size.minWidth, height: size.minHeight });
+  const winOpts: Electron.BrowserWindowConstructorOptions = {
+    width: remembered?.width ?? size.width,
+    height: remembered?.height ?? size.height,
+    // 位置也记（用户摆过的位置别再给他弹回屏幕中间）；没记过则由系统决定
+    ...(remembered?.x !== undefined && remembered?.y !== undefined ? { x: remembered.x, y: remembered.y } : {}),
+    minWidth: size.minWidth,
+    minHeight: size.minHeight,
+    // 默认跟随系统亮暗（Mica 背景会随之切换深浅）
+    // backgroundMaterial: 'mica' 仅 Win11 有效；旧版本自动降级无副作用
+    // 用不透明底色：无边框窗口若背景全透明，放大/最大化时未渲染区域会显示黑色残影/形状异常
+    //   （--surface-glass 本身约 90% 不透明，视觉几乎无差异，Mica 磨砂不受影响）
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0a0c10' : '#dce4ec',
+    title: 'Win-Box',
+    // 无边框自定义标题栏：窗口控制（最小化/最大化/关闭）与拖拽由渲染层 TitleBar 处理
+    frame: false,
+    autoHideMenuBar: true,
+    icon: app.isPackaged ? undefined : join(__dirname, '..', '..', 'build', 'icon.png'),
+    ...(process.platform === 'win32' ? { backgroundMaterial: 'mica' as const } : {}),
+    webPreferences: {
+      preload: join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  };
+  mainWindow = new BrowserWindow(winOpts);
+  // 接着记住它 —— resize/move（防抖）/ 最大化切换 / 关闭时落盘（见 ui/windowState）
+  watchWindowState('main', mainWindow);
+  // 登记为主窗口（界面缩放要按倍率重排它的尺寸）+ 立刻套用当前倍率
+  registerUiWindow(mainWindow);
+  setMainWindowProvider(() => mainWindow);
+  applyUiScale();
+
+  // Win11 无边框圆角在最大化时露出右上角黑角（关闭钮旁异形）：最大化取消圆角、还原恢复
+  const setCorner = (round: boolean) => {
+    if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
+  };
+  // 最大化/还原后强制重绘：无边框窗口在最大化动画期间 webContents 视口可能未铺到新尺寸，
+  //   未重绘区域会直接显示 backgroundColor（暗色）→ 观感像"小窗贴左上、右侧补背景"。强制重绘兜底。
+  const refreshContent = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        const { webContents } = mainWindow;
+        if (!webContents.isDestroyed()) webContents.invalidate();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  mainWindow.on('maximize', () => { setCorner(false); refreshContent(); });
+  mainWindow.on('unmaximize', () => { setCorner(true); refreshContent(); });
+
+  /**
+   * 上次退出时是最大化 → 立刻最大化。
+   *   必须放在上面两个监听**之后**（圆角/重绘兜底要先挂上，否则最大化的黑角与「小窗贴左上」都不修）；
+   *   放在加载内容之前 ⇒ 不会看到「先小窗、再弹成大窗」的观感。
+   */
+  if (remembered?.maximized) {
+    try {
+      mainWindow.maximize();
+    } catch {
+      /* 个别环境最大化失败（驱动/窗口管理器）：保持还原尺寸即可 */
+    }
+  }
+
+  if (isDev()) {
+    mainWindow.loadURL('http://localhost:5173');
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  } else {
+    mainWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
+  }
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+app.whenReady().then(async () => {
+  // 数据目录（安装目录/data；老用户自动迁移 + 清理旧 C 盘目录）——排障第一现场
+  try {
+    const m = dataDirReport.migration;
+    const migDesc = m
+      ? `迁移=${m.status}${m.files ? `（${m.files} 文件 / ${(m.bytes / 1024 / 1024).toFixed(1)}MB）` : ''}${m.skipped ? `，跳过可重建缓存 ${m.skipped} 项` : ''}${m.status === 'moved' ? '（整目录移动）' : ''}${m.cleanedLegacy ? '，旧目录已清理' : ''}${m.error ? `，注意：${m.error}` : ''}`
+      : '迁移=无旧数据';
+    if (dataDirReport.mode === 'fallback') {
+      fileLogger.w(
+        `数据目录: ${dataDirReport.target}（回退，计划目录 ${dataDirReport.planned}）：${dataDirReport.reason || ''}`,
+      );
+    } else {
+      fileLogger.i(`数据目录: ${dataDirReport.target}（模式 ${dataDirReport.mode}；${migDesc}）`);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 启动即记录资源根定位结果：打包后（尤其 portable 的 7z-out 解压布局）
+  // 若再出现「JRE 缺失」，日志首行就能看出真实路径命中情况。
+  try {
+    const { resourcesDir, resourcesDirDebug } = await import('./util/paths');
+    const dir = resourcesDir();
+    const ok = existsSync(join(dir, 'jvm', 'jre', 'bin', 'java.exe'));
+    fileLogger.i(`资源根: ${dir} | java.exe: ${ok ? 'OK' : '缺失'}`);
+    if (!ok) fileLogger.w('资源候选路径探测:\n' + resourcesDirDebug());
+  } catch (e) {
+    fileLogger.w('资源根探测失败: ' + (e instanceof Error ? e.message : String(e)));
+  }
+
+  // 构建标记 —— 日志排障第一行就能确认「跑的是哪只构建」。
+  // 背景：同版本号覆盖安装时日志无法区分新旧产物（1.20.0 两次都叫 1.20.0），
+  //   此标记随每次 main 改动手工递增（含当次关键词，grep 即证）。
+    fileLogger.i(`build: 20261012.1 release-${app.getVersion()}`);
+
+  // **更新后首次启动**清空应用私有缓存（winbox-cache）。
+  //   背景：升级下载的安装包落在 `winbox-cache/update/` 且从不删除，逐版累积会让安装目录涨到 GB 级。
+  //   判定 = 与 `<userData>/last-run-version.json` 记的「上次运行版本」比较，版本变化即视为更新后首次启动；
+  //   **仅打包态生效**（开发态版本抖动不应误清）；标记文件放在 winbox-cache 之外，不会被本次清理删掉。
+  //   清理后所有内容自动重建（见下方 `enablePrewarm` 之后的 `rewarmAfterCacheClear`）。
+  let privateCacheReset: ClearCacheResult | null = null;
+  try {
+    const marker = lastRunVersionPath(userDataDir());
+    const prev = readLastRunVersion(marker);
+    if (app.isPackaged && isFirstLaunchAfterUpdate(prev, app.getVersion())) {
+      privateCacheReset = clearWinboxCache(cacheDir());
+      fileLogger.i(
+        `更新后首次启动（${prev} → ${app.getVersion()}）：已清空应用私有缓存 winbox-cache（释放 ${(privateCacheReset.freedBytes / 1024 / 1024).toFixed(1)}MB；`
+          + `清理 ${privateCacheReset.cleared.length} 项${privateCacheReset.cleared.length ? `：${privateCacheReset.cleared.slice(0, 12).join('/')}` : ''}`
+          + `${privateCacheReset.failed.length ? `；失败 ${privateCacheReset.failed.join('/')}` : ''}）`,
+      );
+    }
+    if (app.isPackaged) writeLastRunVersion(marker, app.getVersion());
+  } catch (e) {
+    fileLogger.w('更新后清空私有缓存失败：' + (e instanceof Error ? e.message : String(e)));
+  }
+
+  try {
+    await proxy.start();
+  } catch {
+    fileLogger.w('本地代理启动失败，直播归一化可能受影响');
+  }
+  // 网络代理设置（用户可在配置页填 http 代理；用于被 DNS 污染 / SNI 阻断的站点）。
+  //   初始化后所有出站（本进程请求 / 本地中继 / JVM 与 Python 蜘蛛 / 嗅探窗口）统一生效。
+  try {
+    const { initProxySettings } = await import('./net/proxy');
+    const { userDataDir } = await import('./util/paths');
+    initProxySettings(join(userDataDir(), 'proxy.json'));
+  } catch (e) {
+    fileLogger.w('代理设置初始化失败：' + (e as Error).message);
+  }
+  // 播放/落盘诊断落盘（`<userData>/logs/play-diag-*.jsonl`）
+  //   注入式（playDiag 不静态依赖 electron），供「落盘/播放成功率」排查取数。
+  try {
+    const { initPlayDiag } = await import('./util/playDiag');
+    const { userDataDir } = await import('./util/paths');
+    initPlayDiag({
+      logDir: () => join(userDataDir(), 'logs'),
+      log: (m: string) => fileLogger.i(m),
+    });
+  } catch (e) {
+    fileLogger.w('播放诊断初始化失败：' + (e as Error).message);
+  }
+  // 网盘会话必须在蜘蛛预热前准备好：夸克 member 接口会补发新版 __puus，
+  //   而某壳类源的蜘蛛在 init 时只读一次 cookie。失败时保留旧凭据并继续启动。
+  try { host.syncDriveFiles(); } catch { /* 同步失败不影响启动 */ }
+  try { await host.refreshDriveSessions(); } catch (e) {
+    fileLogger.w('网盘会话刷新失败（保留现有绑定）：' + (e as Error).message);
+  }
+  try { host.syncDriveFiles(); } catch { /* 同步失败不影响启动 */ }
+  host.enablePrewarm();
+  // 更新后已清空 winbox-cache（含 jar 转换产物与常驻运行时）→ 立刻在后台重建，
+  //   否则用户下次进源要现付「下载 + dex2jar + JVM 冷启动」（实测 37s，会被请求超时顶掉）。
+  if (privateCacheReset) {
+    try { host.rewarmAfterCacheClear(); } catch { /* 预热失败不影响清理结果 */ }
+  }
+  // 插件宿主：物化随包官方插件 + 刷新登记表（失败不阻塞启动）
+  try {
+    await plugins.init();
+    const items = await plugins.list();
+    fileLogger.i(`插件：登记 ${items.length} 个（${items.map((p) => `${p.id}@${p.version}/${p.source}`).join('、') || '无'}）`);
+  } catch (e) {
+    fileLogger.w('插件初始化失败：' + (e instanceof Error ? e.message : String(e)));
+  }
+  registerIpc(host, dav, dlna, updater, localPkgs, plugins, playerEngines);
+  /**
+   * 内存基线探针 —— 启动后 15s 采一次「空闲基线」（此时预热常驻池已就绪），
+   *   供与「播放中」的采样对照；播放中的 60s 采样由 ipc 的 `media:state`（播放器窗口）触发。
+   *   口径与隐私说明见 util/memProbe（只记内存数字与进程名，不含 URL / 凭据）。
+   */
+  setTimeout(() => {
+    void import('./util/memProbe').then((m) => m.sampleMemory('idle@15s')).catch(() => undefined);
+  }, 15_000).unref?.();
+  // 老板键：注入窗口提供者（主窗口 + 播放器窗口）并按上次设置注册全局快捷键
+  bossKey.start(() => {
+    const ws: BrowserWindow[] = [];
+    if (mainWindow && !mainWindow.isDestroyed()) ws.push(mainWindow);
+    const pw = playerWindow();
+    if (pw) ws.push(pw);
+    return ws;
+  });
+  bossKey.apply();
+  // 关闭播放器窗口 → 删除本次夸克转存落盘文件（观看进度保留在本地历史）
+  onPlayerWindowClosed(() => {
+    void host.quarkDeletePending().catch(() => undefined);
+  });
+  // 启动时清理上次遗留的夸克落盘文件（此前关闭/退出未删成功的）
+  void host.quarkDeletePending().catch(() => undefined);
+  createWindow();
+  // 启动时自动订阅刷新（≥7 天一次，静默后台执行，失败仅记日志）
+  void host.maybeAutoRefreshSubscriptions();
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('window-all-closed', () => {
+  proxy.stop();
+  if (process.platform !== 'darwin') app.quit();
+});
+
+// 退出前彻底清理：terminate 所有 JVM 蜘蛛子进程 + 停本地代理 + 断 token 解码，
+//   确保关闭应用后无任何后台残留进程/服务（含 Electron 隐含子进程会在 app.quit 后自行结束）。
+let quitCleanupStarted = false;
+app.on('will-quit', (event) => {
+  // will-quit 不会等待普通 async 回调；先阻止退出，给待清理的网盘目录一次有限时长的
+  // 删除机会，避免窗口关闭后马上退出导致“播完即删”只写入队列却未发出请求。
+  if (!quitCleanupStarted) {
+    quitCleanupStarted = true;
+    event.preventDefault();
+    void Promise.race([
+      host.quarkDeletePending(),
+      new Promise<void>((resolve) => setTimeout(resolve, 8_000)),
+    ]).finally(() => app.quit());
+    return;
+  }
+  try {
+    // 退出前再尝试一次夸克落盘文件清理（失败会持久化到下次启动重试）
+    void host.quarkDeletePending();
+  } catch {
+    /* ignore */
+  }
+  try {
+    host.dispose();
+  } catch {
+    /* ignore */
+  }
+  try {
+    // 停 BT 引擎（回收到 win-quit 这一步，保证不留 aria2c 孤儿进程）
+    torrent.dispose();
+  } catch {
+    /* ignore */
+  }
+  try {
+    proxy.stop();
+  } catch {
+    /* ignore */
+  }
+});
+
+// 兜底：若 did-fail-load 或异常，也让 JVM 子进程不残留
+process.on('beforeExit', () => {
+  try { host.dispose(); } catch { /* ignore */ }
+});
+
+// 单实例锁
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  /**
+   *   真因 = **已有一个实例还在跑，但用户看不到它的窗口** —— 最典型的是老板键
+   *   （默认 `Ctrl+Shift+B`，本机 `bosskey.json` 里 `enabled: true`）：它把**所有窗口连同任务栏图标**
+   *   一起 `hide()`（见 bossKey.ts），用户就以为「软件已关闭」，而它其实活着，
+   *   同时占着 **单实例锁** 与 **本地中继 9978** ⇒ 本次启动拿不到锁 → 走到这里静默 `app.quit()`
+   *   ＝ 既没有窗口、也**不留任何日志**的「闪退」（旧代码这条路径完全无痕，所以日志里查不到）。
+   *   两层修复：① 这里补一行日志（日后「闪退」可定位）；② `second-instance` 里把已有实例**显出来**
+   *   （先退老板模式 → show/restore/focus；没有主窗口就补一个），让用户看到软件其实还在运行。
+   */
+  fileLogger.w(
+    '已有实例在运行（单实例锁被占用）→ 本次启动退出；若界面上看不到窗口，多半是上一实例被老板键（默认 Ctrl+Shift+B）隐藏或残留：'
+    + '按一次老板键可恢复，或在任务管理器结束 Win-Box（本地中继 9978 由该实例占着）',
+  );
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    fileLogger.w('检测到第二实例启动：已有实例在运行 → 退出老板模式并把窗口显出来');
+    try {
+      if (bossKey.isActive) bossKey.exit(); // 老板键隐藏态：先恢复，否则下面的 show() 也没人看得到
+    } catch {
+      /* ignore */
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow(); // 残例态（主窗口早没了但进程还在）→ 补一个窗口，别让用户对着"闪退"发呆
+      return;
+    }
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+  });
+}

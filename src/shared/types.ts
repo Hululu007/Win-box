@@ -1,0 +1,653 @@
+// src/shared/types.ts
+// 跨进程 DTO 的唯一来源。站源/直播字段严格使用上游英文原名（tvg-logo、catchup-source、#genre#），
+// 禁止转小驼峰，以保证序列化结果与安卓互通。
+
+/** 顶层站源配置（对应安卓 ApiConfig.parseJson 解析结果） */
+export interface SiteConfig {
+  sites: SourceBean[];
+  parses: ParseBean[];
+  lives: LiveBean[];
+  flags: string[]; // 需走 VIP 解析的 flag
+  spider: string; // 全局 dex jar 兜底
+  jarCache: string; // "true" / "false"，字符串语义
+  danmaku: string;
+  wallpaper: string;
+  hosts: Record<string, string>; // "a=b" 按第一个 = 切一次
+  rules: RuleItem[];
+  doh: string[];
+  ads: string[];
+  proxy: ProxyRule[];
+  /** 多仓订阅格式 {"urls":[...]} 被识别时填这里，主流程不解析 sites */
+  urls?: MultiConfigEntry[];
+}
+
+export interface MultiConfigEntry {
+  name: string;
+  url: string; // 空 → 回退 api
+}
+
+export interface SourceBean {
+  key: string; // 必填
+  name: string; // 默认 = key
+  type: number; // 必填：0/1/2/3/4/-1
+  api: string; // 必填
+  searchable: number; // 默认 1，用 0/1 非布尔
+  quickSearch: number; // 默认 1
+  changeable: number; // 默认 1
+  filterable: number; // 默认 1；key 以 py_ 开头强制 1
+  playUrl: string;
+  ext: string;
+  jar: string; // "URL" 或 "URL;md5;xxx"，另有 img+ 前缀变体
+  playerType: number; // 默认 -1
+  categories: string[] | null;
+  timeout: number; // 秒；0 → 默认 15；有效值 clamp [5,60]
+  click: string; // "host;selector"
+  style: string;
+  /**
+   * 本地包「网页源」：该源的网页首页（`homePage` 字段）。
+   * 上游形态：html 页自带 UI，靠宿主 `window.fm` 桥拉数据（见 shared/webbridge.ts）。
+   * 空 = 普通源（走常规分类网格）。
+   */
+  homePage?: string;
+}
+
+/** 分类筛选：单个可选值（onesource type_flag 联动，v 为空时回退 n） */
+export interface FilterOption {
+  tab: string;
+  n: string;
+  v: string;
+}
+
+/** 分类筛选：一组（上游 CMS JSON 的 class[].filters 形如 {key:{key,name,value:[{tab,n,v}]}}） */
+export interface FilterGroup {
+  key: string;
+  name: string;
+  value: FilterOption[];
+}
+
+export interface ParseBean {
+  name: string; // 必填（无 has() 保护）
+  url: string; // 必填；内置超级解析用约定名
+  ext: string; // object → JSON.stringify
+  type: number; // 默认 0；4 = 内置超级解析
+}
+
+export interface LiveBean {
+  name: string; // 默认 "线路{N}"
+  api: string;
+  type: string; // 字符串；"0" | "3"，其它值清空频道
+  url: string; // 空则回退 api
+  jar: string;
+  ext: string;
+  epg: string;
+  playerType: string;
+  timeout: number; // clamp [5,30]
+  /** EPG：直播线路时区（IANA，如 Asia/Shanghai）；空/缺省 = 本机时区（对齐 FongMi `Live.getZoneId`） */
+  timeZone?: string;
+  header?: Record<string, string>;
+  ua?: string;
+}
+
+// ---------- 直播 ----------
+export interface LiveGroup {
+  group: string; // 归一化后；空/Ungrouped → "直播"
+  channels: LiveChannel[];
+}
+
+export interface LiveChannel {
+  name: string; // 默认 "Unnamed"
+  urls: string[]; // 每项原始 URL（已按 # 切分、去重、isUrl 过滤）
+  logo: string;
+  epg: string;
+  ua: string;
+  click: string;
+  format: string;
+  origin: string;
+  referer: string;
+  'tvg-id': string;
+  'tvg-name': string;
+  'tvg-chno': string;
+  parse?: number;
+  header?: Record<string, string>;
+  catchup?: { type: string; source: string; replace: string };
+}
+
+export interface LiveLine {
+  index: number; // 从 1 起
+  name: string; // 无 $ 时 = "源" + index
+  url: string;
+}
+
+// ---------- 直播 EPG（节目单） ----------
+/** 单档节目（对齐 FongMi `EpgData`：标题 + HH:mm 起止 + epoch 起止） */
+export interface EpgProgram {
+  title: string;
+  start: string; // HH:mm（live.timeZone 时区）
+  end: string; // HH:mm
+  startTime: number; // epoch ms
+  endTime: number; // epoch ms
+}
+
+/** EPG 频道匹配引用（渲染层从 LiveChannel 组装；`epg` 为频道级 XMLTV 地址，可空） */
+export interface EpgChannelRef {
+  tvgId: string;
+  tvgName: string;
+  name: string;
+  epg?: string;
+}
+
+/** 某频道的「当前 / 下一档」（主进程按请求时刻从节目表算出） */
+export interface LiveEpgEntry {
+  current?: EpgProgram;
+  next?: EpgProgram;
+}
+
+/** `live:epg` 返回：键（tvg-id / tvg-name / 频道名）→ 当前与下一档 */
+export interface LiveEpgResult {
+  byKey: Record<string, LiveEpgEntry>;
+}
+
+// ---------- 点播 ----------
+export interface VodItem {
+  id: string;
+  name: string;
+  pic: string;
+  remarks: string;
+  year: string;
+  area: string;
+  type: string;
+  sourceKey: string;
+  /**
+   * 
+   * 源侧 `vod_tag` 原样透传 —— `folder` = **文件夹条目**（盘搜/网盘的「夸克 (92个)」这类），
+   * 点击应拿它的 id 走 `categoryContent`（文件夹展开），而不是进详情页（详情必空）。
+   */
+  tag?: string;
+}
+
+export interface Episode {
+  name: string;
+  url: string;
+}
+
+// ---------- 聚合搜索 ----------
+/** 聚合结果条目：继承点播条目并标注来源 */
+export interface AggVodItem extends VodItem {
+  sourceName?: string; // 命中来源显示名
+  sameFromOtherSources?: number; // 同名片在其它源也命中的数量（去重后计数）
+}
+
+/** 单源搜索结果状态 */
+export interface SearchPerSource {
+  key: string;
+  name: string;
+  status: 'ok' | 'empty' | 'error';
+  count?: number;
+  error?: string; // status=error 时的可读原因
+  ms?: number;
+}
+
+/** 逐源体检条目 */
+export interface AuditItem {
+  key: string;
+  name: string;
+  type: number;
+  kind: 'cms-xml' | 'cms-json' | 'js' | 'jar' | 'py' | 'unsupported' | 'unknown';
+  items: number;
+  classes: number;
+  homeFallback?: boolean;
+  extEmpty: boolean;
+  error?: string;
+  ms: number;
+  health: 'ok-content' | 'ok-classes' | 'needs-ext' | 'empty' | 'error';
+  usable: boolean;
+  needsExt: boolean;
+  advice: string;
+}
+
+/** 聚合搜索报告 */
+export interface SearchAllReport {
+  items: AggVodItem[];
+  perSource: SearchPerSource[];
+  hitSources: number; // 命中源数（count>0）
+  failedSources: number; // 出错源数
+  totalRaw: number; // 汇总前原始命中数
+  /**
+   * 本次报告来自**本地缓存**（同关键词 5 分钟内重复搜索 → 秒回）。
+   * 值为缓存写入时间戳；UI 据此提示「本地缓存 · 点『重新搜索』刷新」。
+   */
+  cachedAt?: number;
+  /**
+   * 本次有 N 个源因「运行时正在下载/转换」未参与（清缓存/首装后的第一次搜索）。
+   * UI 据此显示醒目横幅并在约 25 秒后**自动重搜一次**，避免用户面对空结果无从下手。
+   */
+  pendingSources?: number;
+}
+
+/**
+ * 聚合搜索「流式进度」事件：每完成一个源就推一条给渲染层，
+ * 让结果**边搜边出**（此前要等全部源跑完，慢源多时界面几十秒空白 → 「搜索特别慢」的观感主因）。
+ */
+export interface SearchAllProgressEvent {
+  /** 本次搜索关键词（渲染层据此丢弃过期事件） */
+  wd: string;
+  /**
+   * 该源的结果（结构同 mergeSearchResults 的输入）。
+   * **可选** —— 快速窗口到点时会推一条「不带 source」的进度，
+   * 只用于告诉 UI「已出 X 个、其余 N 个仍在补搜」（用户不必干等所有慢源）。
+   */
+  source?: { key: string; name: string; status: 'ok' | 'empty' | 'error'; items?: VodItem[]; error?: string; ms?: number };
+  /** 已完成的源数 / 总源数 */
+  done: number;
+  total: number;
+  /** 仍在补搜的源数（= total - done，供 UI 显示「其余 N 个仍在补搜」） */
+  pending?: number;
+}
+
+export interface VodDetail {
+  id: string;
+  name: string;
+  pic: string;
+  type: string;
+  year: string;
+  area: string;
+  director: string;
+  actor: string;
+  des: string;
+  remarks: string;
+  flags: string[];
+  episodes: Record<string, Episode[]>;
+}
+
+export interface PlayResult {
+  parse: number; // 0 直连 / 1 需解析
+  url: string; // 可能多个，用 # 分隔
+  playUrl: string;
+  flag: string;
+  header?: Record<string, string>;
+  message?: string;
+  /** 蜘蛛解析标记：生态里可能是 0/1，也可能是解析站 URL → 透传不加工 */
+  jx?: number | string;
+  /** 播放地址属于「cookie 型」网盘且该 provider 未绑定 → 渲染层提示去配置页绑定（值为网盘 provider，如 quark/uc/baidu/115） */
+  needDriveCookieBind?: string;
+  /**
+   * 桌面版无载体的原始链接（磁力 / 电驴）——`url` 置空 + `message` 上屏时一并给出，
+   * 主进程把它复制到剪贴板（用户可直接粘进 qBittorrent / 迅雷等工具）。见 `engine/vod/playLink.ts`。
+   */
+  externalLink?: string;
+}
+
+// ---------- TMDB 元数据补全（源缺封面/缺简介时的兜底，主进程侧查询） ----------
+export interface MetaHit {
+  title: string;
+  year: number | '';
+  poster: string; // 完整可引用 URL（https://image.tmdb.org/t/p/w342/...）
+  overview: string;
+  type: 'movie' | 'tv';
+  /** TMDB 条目 id（详情页「演职员/相关推荐」用它再请求一次详情；无则说明是豆瓣/360 命中） */
+  tmdbId?: number;
+  /**
+   * TMDB `backdrop_path`（**横版剧照**，w1280）。
+   *   详情页背景只允许用横版图 —— `images.backdrops` 取不到时用它兜底，**绝不退回竖版封面**（会被裁得很难看）。
+   */
+  backdrop?: string;
+}
+
+// ---------- 详情页增强：演职员 / 类型 / 相关推荐（TMDB，`meta:extra`） ----------
+export interface MetaCastMember {
+  name: string;
+  /** 饰演角色（TMDB `character`，可能为空） */
+  character?: string;
+}
+
+export interface MetaRecommendation {
+  title: string;
+  year: number | '';
+  /** 已包装为本地 /img 中继的封面 URL */
+  poster: string;
+  tmdbId?: number;
+  mediaType: 'movie' | 'tv';
+}
+
+export interface MetaExtra {
+  cast: MetaCastMember[];
+  genres: string[];
+  recommendations: MetaRecommendation[];
+  /** 导演名（TMDB `credits.crew[job=Director]` / 剧集 `created_by`）；
+   *  详情页在源数据缺导演时用它补展示 */
+  directors: string[];
+}
+
+// ---------- 详情页「豆瓣」增强：相关推荐 / 影评（`meta:doubanExtra`） ----------
+// 来源：movie.douban.com/j/subject_suggest（取 id）+ m.douban.com rexxar
+//   `{movie|tv}/{id}/recommendations` · `{movie|tv}/{id}/reviews` · `{movie|tv}/{id}?for_mobile=1`（取 intro 梗概）。
+export interface DoubanExtraItem {
+  id: string;
+  title: string;
+  year: number | '';
+  /** 已包装为本地 /img 中继的封面 URL */
+  poster: string;
+  /** 梗概（豆瓣 `intro`，已截断为一行）；取不到时为空串（UI 退用 subtitle） */
+  overview: string;
+  /** 豆瓣自带的副标题行（`年份 / 地区 / 类型 / 导演 / 主演`）—— 推荐条目里的「简介」原始形态 */
+  subtitle: string;
+  /** 豆瓣评分（0~10），无则 undefined */
+  rating?: number;
+  mediaType: 'movie' | 'tv';
+  /** 豆瓣条目页（外链兜底） */
+  url: string;
+}
+
+export interface DoubanReviewItem {
+  id: string;
+  title: string;
+  /** 影评摘要（豆瓣 abstract，已截断） */
+  abstract: string;
+  /** 影评评分（1~5，豆瓣口径），无则 undefined */
+  rating?: number;
+  /** 「有用」数 */
+  useful: number;
+  /** 评论数 */
+  comments: number;
+  author: string;
+  /** 发表时间（原样字符串，形如 `2023-01-29 13:21:07`） */
+  date: string;
+  /** 豆瓣影评页（点击用系统浏览器打开） */
+  url: string;
+}
+
+/** 影评正文块（豆瓣正文里 `<img>` **只有 `id="img_XXX"`、没有 src**，
+ *   真实地址在 `photos[].image.*.url` ⇒ 按 id 还原成图片块，否则长影评会丢大半内容） */
+export type DoubanReviewBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; url: string; caption?: string };
+
+/** 影评全文（点击影评行 → 独立小窗口展示用；`GET rexxar/api/v2/review/{id}?for_mobile=1`） */
+export interface DoubanReviewDetail {
+  id: string;
+  title: string;
+  author: string;
+  /** 影评评分（1~5），无则 undefined */
+  rating?: number;
+  date: string;
+  useful: number;
+  comments: number;
+  /** 豆瓣影评页（窗口内「在豆瓣打开」用） */
+  url: string;
+  /** 豆瓣标记「含剧透」 */
+  spoiler: boolean;
+  blocks: DoubanReviewBlock[];
+}
+
+export interface DoubanDetailExtra {
+  /** 豆瓣条目 id（未命中为 ''） */
+  id: string;
+  recommendations: DoubanExtraItem[];
+  reviews: DoubanReviewItem[];
+}
+
+// ---------- 发现页（国内榜单；与播放源解耦） ----------
+export interface DiscoverItem {
+  title: string;
+  year: number | '';
+  /** 已包装为本地 /img 中继的封面 URL */
+  poster: string;
+  /** 横版剧照（TMDB `backdrop_path`，w1280，已 /img 中继）—— Hero 背景只用横版图 */
+  backdrop?: string;
+  tmdbId?: number;
+  doubanId?: string;
+  mediaType: 'movie' | 'tv';
+}
+
+export interface MovieHotItem {
+  title: string;
+  rank: number;
+  score: string;
+}
+
+export interface MovieHotList {
+  source: 'baidu';
+  items: MovieHotItem[];
+  fetchedAt: number;
+  stale: boolean;
+}
+
+export interface DiscoverSection {
+  id: string;
+  title: string;
+  items: DiscoverItem[];
+}
+
+/**
+ * 某部片的图集（发现页 Hero「横版剧照轮播」用）。
+ * backdrops = TMDB 横版剧照（w1280，已按中文优先 + 评分排序，≤6 张）；
+ * posters = 竖版海报（w342，≤8 张）。均已包装为本地 /img 中继 URL。
+ */
+export interface MetaImages {
+  backdrops: string[];
+  posters: string[];
+}
+
+// ---------- 发现页「分类」浏览（TMDB 类型清单 + 按类型翻页） ----------
+export interface DiscoverGenre {
+  id: number;
+  name: string;
+}
+
+export interface DiscoverGenrePage {
+  items: DiscoverItem[];
+  page: number;
+  totalPages: number;
+}
+
+// ---------- 导入诊断 ----------
+export type SiteStatus = 'OK' | 'SKIP' | 'DEGRADE';
+export type SiteReason =
+  | 'MISSING_KEY'
+  | 'MISSING_TYPE'
+  | 'MISSING_API'
+  | 'UNKNOWN_TYPE' // type=2 或未知值
+  | 'UNSUPPORTED_JAR'
+  | 'UNSUPPORTED_PY'
+  | 'UNSUPPORTED_BYTECODE'
+  | 'UNSUPPORTED_PUSH';
+
+export interface SiteReportItem {
+  index: number;
+  key: string;
+  name: string;
+  type: number;
+  api: string;
+  status: SiteStatus;
+  reason?: SiteReason;
+  message: string;
+}
+
+export interface ImportReport {
+  total: number;
+  ok: number;
+  skipped: number;
+  degraded: number;
+  items: SiteReportItem[];
+}
+
+// ---------- 用户配置文件（<userData>/user-config.json，见 docs/config-file.md） ----------
+export interface UserGlobalConfig {
+  spider: string; // 顶层全局 jar URL（配置顶层 spider 字段）
+  flags: string[]; // 需走 VIP 解析的 flag
+}
+
+export interface UserUiState {
+  activeSourceKey: string; // 当前选中的站源 key（重启保留）
+  activeLiveIndex: number; // 当前选中的直播线路下标（从 0 起）
+}
+
+/** 持久化在 JsonStore('user-config') 键下的完整结构 */
+export interface UserConfig {
+  version: number; // 结构版本（当前 2），升级迁移钩子看这里
+  apiUrl: string; // 当前配置来源地址（空 = 手动/粘贴管理）
+  global: UserGlobalConfig;
+  sources: SourceBean[]; // 有序 = UI 顺序（当前 profile 的有效源）
+  lives: LiveBean[];
+  /**
+   * 解析接口（订阅顶层 `parses`）。
+   *   此前只在导入时解析、**未持久化也未送进运行时**，导致 parse===1 的播放地址无处可解。
+   *   注意：**不含**合成的「超级解析」(type=4) —— 该条由 ParseService 的内置嗅探兜底承担，
+   *   存进来只会在每次 config 往返时被 parseParses 反复 unshift 出重复项。
+   */
+  parses: ParseBean[];
+  ui: UserUiState;
+  /** 多配置档案：每份保存一份可离线重建的订阅 JSON（新增于 v2） */
+  profiles: UserProfile[];
+  activeProfileId: string; // 当前生效 profile id（'' = 无档案管理，仅源列表）
+  /**
+   * **用户手动删除过的源 key 墓碑**。
+   *   订阅是"全量替换"语义（导入 / 启动时 7 天自动刷新 / 档案切换都用订阅自带源重建 `sources`）——
+   *   若不记账，用户删掉的源会在任何一次订阅往返后复活（观感 =「删了还在」）。
+   *   口径与「本机导入的本地直播线路」（withLocalLives）一致：**用户的本地增删改要在订阅往返里保住**。
+   *   用户手动**重新添加**同一 key（addSource）时自动清除对应墓碑，所以"删了想要回来"有明确路径。
+   */
+  deletedSourceKeys: string[];
+}
+
+/** 多配置档案：保存"一份订阅"的原始 JSON（解析后可重建 sources/lives/global），用于多 JSON 源切换 */
+export interface UserProfile {
+  id: string; // 唯一（URL 尾段或手动命名 slug 化）
+  name: string; // 显示名
+  apiUrl: string; // 来源地址（粘贴导入为空）
+  json: string; // 归一化订阅 JSON（{spider,flags,sites,lives}，可再经 parseSiteConfig 解析）
+  sourceCount: number; // 该档案含源数（展示用，归一化时重算）
+  importedAt: string; // ISO 时间
+}
+
+/**
+ * 换源弹层的「左订阅 / 右源」视图。
+ * 每份档案给出源 key/name 清单：当前生效档案取**运行期真实源列表**（含手动增删改），
+ * 其余档案解析其存档 JSON（解析失败给空清单，不阻塞弹层）。
+ */
+export interface ProfileSitesView {
+  activeId: string;
+  profiles: Array<{
+    id: string;
+    name: string;
+    sites: Array<{ key: string; name: string }>;
+  }>;
+}
+
+/** 数据目录信息（安装目录/data；老用户迁移结果与回退原因） */
+export interface DataDirInfo {
+  path: string;
+  mode: 'dev' | 'activated' | 'fallback';
+  planned: string;
+  reason?: string;
+  migration?: {
+    status: 'no-legacy' | 'moved' | 'copied' | 'already' | 'failed';
+    files: number;
+    bytes: number;
+    skipped: number;
+    cleanedLegacy: boolean;
+    error?: string;
+  };
+}
+
+/** 单源实时诊断报告（vod:debug） */
+export interface SourceDebugReport {
+  key: string;
+  type: number;
+  api: string;
+  kind: 'cms-xml' | 'cms-json' | 'js' | 'jar' | 'py' | 'unsupported' | 'unknown';
+  ext: { present: boolean; jsonOk: boolean; preview: string };
+  jarUrl: string; // 解析后的站点/全局 jar（type3 jar 用）
+  probe?: { url: string; status: number; bytes: number; contentType: string; preview: string; parsedOk: boolean; classes: number; items: number; error?: string };
+  run?: { ok: boolean; ms: number; classes: number; items: number; head: string; error?: string };
+  verdict: string; // 人读结论
+}
+
+export type SourceMoveDirection = 'up' | 'down' | 'top' | 'bottom';
+
+/** 允许 UI 修改的源字段（key/type/api 一经创建不可改，见 UserConfigManager） */
+export type MutableSourceField =
+  | 'name'
+  | 'ext'
+  | 'jar'
+  | 'playUrl'
+  | 'searchable'
+  | 'quickSearch'
+  | 'filterable'
+  | 'changeable'
+  | 'timeout'
+  | 'categories'
+  | 'style'
+  | 'click';
+
+export type SourceUpdatePatch = Partial<Pick<SourceBean, MutableSourceField>>;
+
+// ---------- 规则 ----------
+export interface RuleItem {
+  host?: string;
+  rule?: string[];
+  filter?: string[];
+  hosts?: string[];
+  regex?: string[];
+  script?: string[];
+}
+
+export interface ProxyRule {
+  name?: string;
+  type?: number;
+  host?: string;
+  server?: string;
+  // 其它字段透传
+  [k: string]: unknown;
+}
+
+// ---------- 宿主从 engine 注入的能力（T04 实现，T02 仅定义） ----------
+export interface HttpRequest {
+  url: string;
+  /** 增加 `propfind`（WebDAV 列目录）；HttpClient 统一转大写后交给 undici */
+  method?: 'get' | 'post' | 'head' | 'propfind';
+  headers?: Record<string, string>;
+  body?: string;
+  data?: unknown;
+  postType?: 'json' | 'form' | 'form-data';
+  timeoutMs?: number;
+  /** 整个请求（含重定向和响应体读取）的总期限；未设置时沿用 timeoutMs 的阶段超时语义。 */
+  totalTimeoutMs?: number;
+  redirect?: 0 | 1;
+  charset?: string;
+  buffer?: 0 | 1 | 2; // 0 文本 / 1 字节数组 / 2 base64
+  /**
+   * `1` = 本请求走 **DoH 解析**（host 被 DNS 污染时用）。
+   *   仅用于「系统 DNS 结果明显不对」的兜底重试（订阅拉取、CMS 源请求），默认不开。
+   */
+  doh?: 0 | 1;
+}
+
+export interface HttpResponse {
+  status: number;
+  headers: Record<string, string | string[]>;
+  content: string | number[]; // buffer=1 时为字节数组
+  finalUrl: string;
+}
+
+export interface HttpClient {
+  request(req: HttpRequest): Promise<HttpResponse>;
+}
+
+export interface KVStore {
+  get(k: string): string;
+  set(k: string, v: string): void;
+  delete(k: string): void;
+}
+
+/** 老板键设置（全局快捷键隐藏/恢复全部窗口） */
+export interface BossKeySettings {
+  enabled: boolean;
+  accel: string; // Electron accelerator，如 'CommandOrControl+Shift+B'
+}
+
+export interface Logger {
+  i(t: string): void;
+  w(t: string): void;
+  e(t: string, err?: unknown): void;
+}

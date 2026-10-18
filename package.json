@@ -1,0 +1,92 @@
+{
+  "name": "win-box",
+  "version": "1.22.1",
+  "private": true,
+  "description": "Win-Box (CatVod 引擎) 的 Windows 桌面移植版 — 导入源规则与安卓版保持一致",
+  "type": "module",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "dev": "concurrently -k -n vite,main,electron -c green,blue,magenta \"vite\" \"node scripts/build-main.mjs --watch\" \"wait-on tcp:5173 && electron .\"",
+    "build:main": "node scripts/build-main.mjs",
+    "build:renderer": "vite build",
+    "build": "npm run build:main && npm run build:renderer",
+    "start": "electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "node scripts/build-release.mjs",
+    "release:upload": "node scripts/upload-release.mjs"
+  },
+  "author": "Win-Box",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
+    "@types/node": "^22.20.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.4",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.4",
+    "wait-on": "^8.0.5"
+  },
+  "dependencies": {
+    "7z-wasm": "1.2.0",
+    "cheerio": "^1.2.0",
+    "crypto-js": "^4.2.0",
+    "fast-xml-parser": "^4.5.7",
+    "hls.js": "^1.7.2",
+    "iconv-lite": "^0.6.3",
+    "mpegts.js": "^1.8.2",
+    "node-unrar-js": "2.0.2",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.3",
+    "undici": "^7.29.1"
+  },
+  "build": {
+    "appId": "com.winbox.win",
+    "productName": "Win-Box",
+    "directories": {
+      "output": "release1.22.1"
+    },
+    "files": [
+      "dist/**",
+      "resources/**",
+      "package.json",
+      "!resources/.tmp/**",
+      "!resources/jvm/stubs-src/**",
+      "!resources/jvm/tools/**",
+      "!resources/jvm/libs/jython-standalone-2.7.3.jar",
+      "!resources/**/hs_err_pid*.log",
+       "!resources/**/replay_pid*.log",
+       "!resources/**/__pycache__/**"
+    ],
+    "asarUnpack": [
+      "resources/**"
+    ],
+    "afterPack": "scripts/after-pack.mjs",
+    "compression": "maximum",
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "differentialPackage": false,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "license": "LICENSE.txt",
+      "artifactName": "${productName} Setup ${version}.${ext}"
+    }
+  }
+}

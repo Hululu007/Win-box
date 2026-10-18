@@ -1,0 +1,131 @@
+// src/main/util/cacheClean.ts — 「清理缓存」：只删可重建的纯缓存，绝不动配置/历史/网盘绑定。
+//
+// 安全边界（与 userData 目录现状对齐）：
+//   - 删：Chromium 各缓存目录（Cache/Code Cache/GPUCache/…）、播放器 blob 临时存储、
+//          jar 转换缓存（cache/spider）—— 全部可在下次使用时自动重建。
+//   - 不删：user-config.json、drive-tokens.json、subtitle.json、tvfan/（Cloud-drive 配置）、
+//           Preferences、Local State、Local Storage（主窗口历史记录 uiMem 存于此）、
+//           Session Storage、Network（含 Chromium 持久登录态）。
+import { existsSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+
+/**
+ * userData 下可安全清理的子目录（删除后 Chromium/应用自动重建）。
+ *
+ * 这些名字是 **Chromium/Electron 自己拥有**的目录 —— 应用私有缓存目录绝不能用这些名字
+ * （Windows 大小写不敏感，`cache` 会与 `Cache` 变成同一个物理目录；事故详见
+ *   `paths.APP_CACHE_DIR_NAME`，回归护栏见 `tests/appCacheDir.spec.ts`）。
+ */
+export const SAFE_USERDATA_SUBDIRS = [
+  'Cache',            // Chromium HTTP 磁盘缓存（海报图等）注意：与本应用私有缓存无关
+  'Code Cache',       // V8/Chromium 代码缓存
+  'GPUCache',
+  'DawnGraphiteCache',
+  'DawnWebGPUCache',
+  'Shared Dictionary',
+  'Dictionaries',
+  'blob_storage',     // 播放器 blob: URL 临时存储
+  'VideoDecodeStats',
+  'WebStorage',
+] as const;
+
+export interface ClearCacheResult {
+  freedBytes: number;
+  cleared: string[];
+  failed: string[];
+}
+
+/** 递归统计目录占用字节数（忽略读不到的子项） */
+function dirSize(abs: string): number {
+  let sum = 0;
+  try {
+    for (const name of readdirSync(abs)) {
+      const p = join(abs, name);
+      try {
+        if (statSync(p).isDirectory()) sum += dirSize(p);
+        else sum += statSync(p).size;
+      } catch { /* 单文件读不到则跳过 */ }
+    }
+  } catch { /* 目录读不到则视为 0 */ }
+  return sum;
+}
+
+/** 删除目录内容（保留目录本身），返回释放字节数；目录不存在视为已清 */
+function clearDirContents(abs: string): { freed: number; ok: boolean } {
+  if (!existsSync(abs)) return { freed: 0, ok: true };
+  try {
+    const freed = dirSize(abs);
+    for (const name of readdirSync(abs)) {
+      rmSync(join(abs, name), { recursive: true, force: true, maxRetries: 2 });
+    }
+    return { freed, ok: true };
+  } catch {
+    return { freed: 0, ok: false };
+  }
+}
+
+/** 单条目占用字节数（目录递归 / 文件取 size） */
+function entrySize(abs: string): number {
+  try {
+    const st = statSync(abs);
+    return st.isDirectory() ? dirSize(abs) : st.size;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 清空**应用私有缓存目录**（`winbox-cache`）的**全部内容**（保留目录本身）。
+ *
+ * 用途：**更新后首次启动**一次性清掉历史安装包（`update/`，逐版累积会让安装目录涨到 GB 级）
+ * 以及随之可重建的运行时（`python` `native`）/ 转换产物（`spider`）/ EPG·BT·图片缓存 ——
+ * 这些都能在下次使用时自动重建（jar 重转、运行时按需重下、EPG/BT/封面重取）。
+ *
+ * 目录由调用方注入（避免本模块依赖 electron）。
+ */
+export function clearWinboxCache(abs: string): ClearCacheResult {
+  const result: ClearCacheResult = { freedBytes: 0, cleared: [], failed: [] };
+  if (!existsSync(abs)) return result;
+  let names: string[];
+  try {
+    names = readdirSync(abs);
+  } catch {
+    result.failed.push(abs);
+    return result;
+  }
+  for (const name of names) {
+    const p = join(abs, name);
+    try {
+      result.freedBytes += entrySize(p);
+      rmSync(p, { recursive: true, force: true, maxRetries: 2 });
+      result.cleared.push(name);
+    } catch {
+      result.failed.push(name);
+    }
+  }
+  return result;
+}
+
+/** 清理全部可安全清除的缓存；返回释放字节数与逐项结果。目录由调用方注入（避免本模块依赖 electron）。 */
+export function clearAppCache(ud: string, sp: string): ClearCacheResult {
+  const result: ClearCacheResult = { freedBytes: 0, cleared: [], failed: [] };
+
+  for (const sub of SAFE_USERDATA_SUBDIRS) {
+    const abs = join(ud, sub);
+    const { freed, ok } = clearDirContents(abs);
+    if (ok) {
+      if (freed > 0 || existsSync(abs)) result.cleared.push(sub);
+    } else {
+      result.failed.push(sub);
+    }
+    result.freedBytes += freed;
+  }
+
+  // jar 转换缓存（cache/spider）：删内容保留目录，下次加载自动重建
+  const { freed: spFreed, ok: spOk } = clearDirContents(sp);
+  result.freedBytes += spFreed;
+  if (spOk) result.cleared.push('cache/spider');
+  else result.failed.push('cache/spider');
+
+  return result;
+}
