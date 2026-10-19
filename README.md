@@ -169,3 +169,12 @@ pnpm run dist             # 打包安装版
 
 代码采用 MIT 许可证（见 [LICENSE](LICENSE)）。请遵守第三方软件（蜘蛛 jar、运行时、播放内核、壳等）各自的版权与许可。
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=astrbotdevs%2Fastrbot%2Cwin-box%2Fwin-box%2Cyagami-hue%2Fwin-box&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=astrbotdevs/astrbot%2Cwin-box/win-box%2Cyagami-hue/win-box&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=astrbotdevs/astrbot%2Cwin-box/win-box%2Cyagami-hue/win-box&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=astrbotdevs/astrbot%2Cwin-box/win-box%2Cyagami-hue/win-box&type=date&legend=top-left" />
+ </picture>
+</a>
